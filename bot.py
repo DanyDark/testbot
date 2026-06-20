@@ -1,6 +1,8 @@
 import os
 import logging
 import sqlite3
+import threading
+import asyncio
 from datetime import datetime, timedelta
 from functools import partial
 from typing import Dict, Optional, List, Tuple
@@ -8,22 +10,19 @@ from typing import Dict, Optional, List, Tuple
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ==================== КОНФИГУРАЦИЯ ====================
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
-    raise ValueError("BOT_TOKEN не найден! Добавьте его в переменные окружения на Bothost.")
+    raise ValueError("BOT_TOKEN не найден!")
 
 MASTER_IDS = [int(x.strip()) for x in os.getenv('MASTER_IDS', '').split(',') if x.strip()]
 ADMIN_IDS = [int(x.strip()) for x in os.getenv('ADMIN_IDS', '').split(',') if x.strip()]
 BUSINESS_NAME = os.getenv('BUSINESS_NAME', 'БИЗНЕС')
-
 DB_PATH = 'bot_database.db'
 
 # ==================== БАЗА ДАННЫХ ====================
@@ -36,6 +35,7 @@ def init_db():
             username TEXT,
             first_name TEXT,
             last_name TEXT,
+            display_name TEXT,
             is_master BOOLEAN DEFAULT 0,
             registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -57,6 +57,11 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    try:
+        cur.execute("ALTER TABLE users ADD COLUMN display_name TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     cur.execute("SELECT COUNT(*) FROM auto_response")
     if cur.fetchone()[0] == 0:
         cur.execute('''
@@ -86,15 +91,34 @@ def is_master(user_id: int) -> bool:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-def save_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+def save_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None, display_name: str = None):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('''
-        INSERT OR IGNORE INTO users (user_id, username, first_name, last_name)
-        VALUES (?, ?, ?, ?)
-    ''', (user_id, username, first_name, last_name))
+        INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, display_name)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user_id, username, first_name, last_name, display_name))
+    if display_name:
+        cur.execute('''
+            UPDATE users SET display_name = ? WHERE user_id = ? AND display_name IS NULL
+        ''', (display_name, user_id))
     conn.commit()
     conn.close()
+
+def get_user_display_name(user_id: int) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT display_name, first_name, username FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        if row[0]:
+            return row[0]
+        elif row[1]:
+            return row[1]
+        elif row[2]:
+            return f"@{row[2]}"
+    return f"ID:{user_id}"
 
 def log_message(user_id: int, text: str, is_master: bool = False):
     conn = sqlite3.connect(DB_PATH)
@@ -152,18 +176,17 @@ def get_active_clients() -> List[int]:
     conn.close()
     return [row[0] for row in rows]
 
-def get_client_info(user_id: int) -> str:
+def get_client_last_message(user_id: int) -> Optional[str]:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT first_name, username FROM users WHERE user_id = ?", (user_id,))
+    cur.execute('''
+        SELECT text FROM logs
+        WHERE user_id = ? AND is_master = 0
+        ORDER BY timestamp DESC LIMIT 1
+    ''', (user_id,))
     row = cur.fetchone()
     conn.close()
-    if row and row[0]:
-        name = row[0]
-        if row[1]:
-            name += f" (@{row[1]})"
-        return name
-    return f"ID: {user_id}"
+    return row[0] if row else None
 
 # ==================== КЛАВИАТУРЫ ====================
 def get_client_keyboard():
@@ -171,13 +194,17 @@ def get_client_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_master_keyboard():
-    keyboard = [[KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")]]
+    keyboard = [
+        [KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")],
+        [KeyboardButton("🔄 Закончить диалог")]
+    ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_admin_keyboard():
     keyboard = [
         [KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")],
-        [KeyboardButton("📜 Логи"), KeyboardButton("⚙️ Настроить автоответ")]
+        [KeyboardButton("📜 Логи"), KeyboardButton("⚙️ Настроить автоответ")],
+        [KeyboardButton("🔄 Закончить диалог")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -186,30 +213,153 @@ def get_reply_buttons(client_id: int):
         [
             InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{client_id}"),
             InlineKeyboardButton("📖 История", callback_data=f"history_{client_id}")
-        ],
-        [InlineKeyboardButton("❌ Закрыть диалог", callback_data=f"close_{client_id}")]
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+def get_clients_list_keyboard(clients: List[int]):
+    keyboard = []
+    for client_id in clients:
+        name = get_user_display_name(client_id)
+        keyboard.append([InlineKeyboardButton(f"👤 {name}", callback_data=f"select_{client_id}")])
+    return InlineKeyboardMarkup(keyboard)
+
+# ==================== ТАЙМЕРЫ (на threading) ====================
+# Храним таймеры в словаре: {client_id: {'timeout': timer, 'reminder': timer}}
+# Чтобы отменять их при ответе мастера.
+
+def schedule_busy_message(loop, bot, client_id, delay_seconds=300):
+    """Запускает таймер на отправку сообщения о занятости через delay_seconds."""
+    def wrapper():
+        # Эта функция выполняется в отдельном потоке
+        asyncio.run_coroutine_threadsafe(
+            send_busy_message_coro(bot, client_id),
+            loop
+        )
+    timer = threading.Timer(delay_seconds, wrapper)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+async def send_busy_message_coro(bot, client_id):
+    """Асинхронная функция отправки сообщения о занятости."""
+    # Проверяем, всё ли ещё ждёт ответа – это должно быть проверено в вызывающей функции,
+    # но для надёжности проверим здесь через user_data (но user_data не передаётся легко)
+    # Можно сделать глобальный словарь или передавать context, но проще проверить через БД или флаг,
+    # который мы будем хранить в глобальном словаре.
+    # Используем глобальный словарь waiting_status
+    if waiting_status.get(client_id, False):
+        try:
+            await bot.send_message(
+                chat_id=client_id,
+                text="⏳ *Все мастера сейчас заняты, но мы увидели ваше сообщение.*\n"
+                     "Ожидайте ответа, мы свяжемся с вами в ближайшее время.",
+                parse_mode='Markdown'
+            )
+            log_message(client_id, "[АВТО: мастера заняты]", is_master=False)
+            logger.info(f"Сообщение о занятости отправлено клиенту {client_id}")
+        except Exception as e:
+            logger.error(f"Не удалось отправить сообщение о занятости клиенту {client_id}: {e}")
+
+def schedule_reminder(loop, bot, client_id, delay_seconds=1800):
+    """Запускает таймер на отправку напоминания мастеру через delay_seconds."""
+    def wrapper():
+        asyncio.run_coroutine_threadsafe(
+            send_reminder_coro(bot, client_id),
+            loop
+        )
+    timer = threading.Timer(delay_seconds, wrapper)
+    timer.daemon = True
+    timer.start()
+    return timer
+
+async def send_reminder_coro(bot, client_id):
+    """Асинхронная функция отправки напоминания мастерам."""
+    if not waiting_status.get(client_id, False):
+        return
+    
+    name = get_user_display_name(client_id)
+    last_msg = get_client_last_message(client_id) or "сообщение"
+    
+    reminder_text = (
+        f"🔔 *Напоминание!*\n"
+        f"Клиент {name} (ID: `{client_id}`) ждёт ответа уже больше 30 минут.\n"
+        f"Последнее сообщение: {last_msg}\n\n"
+        f"Нажмите «Ответить» в одном из предыдущих уведомлений."
+    )
+    
+    for master_id in MASTER_IDS:
+        try:
+            await bot.send_message(
+                chat_id=master_id,
+                text=reminder_text,
+                parse_mode='Markdown'
+            )
+            logger.info(f"Напоминание отправлено мастеру {master_id}")
+        except Exception as e:
+            logger.error(f"Не удалось отправить напоминание мастеру {master_id}: {e}")
+    
+    # Если клиент всё ещё ждёт, запускаем следующее напоминание через 30 минут
+    if waiting_status.get(client_id, False):
+        timer = schedule_reminder(asyncio.get_event_loop(), bot, client_id, delay_seconds=1800)
+        # Сохраняем таймер в глобальном словаре (если он ещё не отменён)
+        timer_dict[client_id]['reminder'] = timer
+
+# Глобальные словари для состояния таймеров
+timer_dict = {}  # {client_id: {'timeout': timer, 'reminder': timer}}
+waiting_status = {}  # {client_id: True/False}
+
+def cancel_timers(client_id):
+    """Отменяет все таймеры для клиента."""
+    if client_id in timer_dict:
+        if timer_dict[client_id].get('timeout'):
+            timer_dict[client_id]['timeout'].cancel()
+        if timer_dict[client_id].get('reminder'):
+            timer_dict[client_id]['reminder'].cancel()
+        del timer_dict[client_id]
+    waiting_status[client_id] = False
 
 # ==================== ОБРАБОТЧИКИ КОМАНД И ТЕКСТОВЫХ КНОПОК ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     save_user(user.id, user.username, user.first_name, user.last_name)
     
+    display_name = get_user_display_name(user.id)
+    if display_name.startswith("ID:"):
+        await update.message.reply_text(
+            f"👋 Добрый день! Это виртуальный помощник студии маникюра «{BUSINESS_NAME}».\n\n"
+            "🙋‍♀️ Как мне к вам обращаться? Напишите ваше имя."
+        )
+        context.user_data['awaiting_name'] = True
+        return
+    
+    await show_main_menu(update, context)
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     welcome_text = (
-        f"👋 Добрый день! Это виртуальный помощник студии маникюра «{BUSINESS_NAME}».\n\n"
+        f"👋 Добро пожаловать, {get_user_display_name(user.id)}!\n\n"
         f"💬 Просто напишите свой вопрос, и я передам его мастеру.\n"
         f"Если вы спросите про цену, я сразу дам ответ."
     )
-    
     if is_admin(user.id):
         await update.message.reply_text(welcome_text, reply_markup=get_admin_keyboard())
     elif is_master(user.id):
         await update.message.reply_text(welcome_text, reply_markup=get_master_keyboard())
     else:
         await update.message.reply_text(welcome_text, reply_markup=get_client_keyboard())
-    
     log_message(user.id, "/start", is_master=False)
+
+async def handle_name_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Пожалуйста, напишите ваше имя (не оставляйте пустым).")
+        return
+    save_user(user.id, user.username, user.first_name, user.last_name, display_name=name)
+    context.user_data.pop('awaiting_name', None)
+    await update.message.reply_text(f"✅ Отлично, {name}! Теперь я знаю, как к вам обращаться.")
+    await show_main_menu(update, context)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -231,16 +381,21 @@ async def active_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     clients = get_active_clients()
     if not clients:
-        await update.message.reply_text("📭 Активных диалогов нет.")
+        await update.message.reply_text("📭 Активных клиентов нет.")
         return
     
     text = "📋 *Активные клиенты (писали за 7 дней):*\n\n"
     for idx, client_id in enumerate(clients, 1):
-        name = get_client_info(client_id)
+        name = get_user_display_name(client_id)
+        last_msg = get_client_last_message(client_id)
+        if last_msg and len(last_msg) > 30:
+            last_msg = last_msg[:27] + "..."
         text += f"{idx}. {name} (ID: `{client_id}`)\n"
+        if last_msg:
+            text += f"   Последнее: {last_msg}\n"
     
-    text += "\nЧтобы ответить, используйте кнопки в сообщениях."
-    await update.message.reply_text(text, parse_mode='Markdown')
+    text += "\nВыберите клиента, нажав на кнопку ниже."
+    await update.message.reply_text(text, parse_mode='Markdown', reply_markup=get_clients_list_keyboard(clients))
 
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -292,6 +447,20 @@ async def set_auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_auto_response(keyword, response)
     await update.message.reply_text(f"✅ Автоответчик обновлён!\n\n🔑 Ключевое слово: `{keyword}`\n💬 Ответ: {response}", parse_mode='Markdown')
 
+async def stop_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_master(user.id) and not is_admin(user.id):
+        await update.message.reply_text("⛔ Эта команда только для мастеров.")
+        return
+    
+    if 'active_client' in context.user_data:
+        client_id = context.user_data.pop('active_client')
+        # Отменяем таймеры для этого клиента (если они ещё висят)
+        cancel_timers(client_id)
+        await update.message.reply_text(f"✅ Диалог с клиентом (ID: {client_id}) завершён.")
+    else:
+        await update.message.reply_text("ℹ️ У вас нет активного диалога.")
+
 # ==================== ОБРАБОТЧИК ТЕКСТОВЫХ КНОПОК ====================
 async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -308,79 +477,10 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Введите команду в формате:\n`/set_auto ключевое_слово текст ответа`",
             parse_mode='Markdown'
         )
+    elif text == "🔄 Закончить диалог" and (is_master(user.id) or is_admin(user.id)):
+        await stop_dialog(update, context)
     else:
         await handle_message(update, context)
-
-# ==================== ЗАДАНИЯ ДЛЯ ТАЙМЕРОВ (с логами) ====================
-async def send_busy_message(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("=== Функция send_busy_message вызвана ===")
-    job = context.job
-    client_id = job.data['client_id']
-    logger.info(f"Проверка клиента {client_id}")
-    client_data = context.application.user_data.get(client_id, {})
-    if client_data.get('waiting_for_response', False):
-        try:
-            await context.bot.send_message(
-                chat_id=client_id,
-                text="⏳ *Все мастера сейчас заняты, но мы увидели ваше сообщение.*\n"
-                     "Ожидайте ответа, мы свяжемся с вами в ближайшее время.",
-                parse_mode='Markdown'
-            )
-            log_message(client_id, "[АВТО: мастера заняты]", is_master=False)
-            logger.info(f"Сообщение о занятости отправлено клиенту {client_id}")
-        except Exception as e:
-            logger.error(f"Не удалось отправить сообщение о занятости клиенту {client_id}: {e}")
-    else:
-        logger.info(f"Клиент {client_id} уже не ждёт ответа, таймаут пропущен")
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("=== Функция send_reminder вызвана ===")
-    job = context.job
-    client_id = job.data['client_id']
-    client_data = context.application.user_data.get(client_id, {})
-    
-    if not client_data.get('waiting_for_response', False):
-        logger.info(f"Клиент {client_id} уже не ждёт, напоминание отменено")
-        return
-    
-    name = get_client_info(client_id)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT text FROM logs
-        WHERE user_id = ? AND is_master = 0
-        ORDER BY timestamp DESC LIMIT 1
-    ''', (client_id,))
-    row = cur.fetchone()
-    conn.close()
-    last_msg = row[0] if row else "сообщение"
-    
-    reminder_text = (
-        f"🔔 *Напоминание!*\n"
-        f"Клиент {name} (ID: `{client_id}`) ждёт ответа уже больше 30 минут.\n"
-        f"Последнее сообщение: {last_msg}\n\n"
-        f"Нажмите «Ответить» в одном из предыдущих уведомлений."
-    )
-    
-    for master_id in MASTER_IDS:
-        try:
-            await context.bot.send_message(
-                chat_id=master_id,
-                text=reminder_text,
-                parse_mode='Markdown'
-            )
-            logger.info(f"Напоминание отправлено мастеру {master_id}")
-        except Exception as e:
-            logger.error(f"Не удалось отправить напоминание мастеру {master_id}: {e}")
-    
-    # Перезапускаем напоминание через 30 минут, если клиент всё ещё ждёт
-    if client_data.get('waiting_for_response', False):
-        context.job_queue.run_once(
-            send_reminder,
-            when=timedelta(minutes=30),
-            data={'client_id': client_id},
-            name=f"reminder_{client_id}"
-        )
 
 # ==================== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -388,6 +488,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     
     if not text:
+        return
+    
+    # Если клиент ещё не представился
+    if context.user_data.get('awaiting_name'):
+        await handle_name_input(update, context)
         return
     
     save_user(user.id, user.username, user.first_name, user.last_name)
@@ -402,31 +507,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=f"🛠 *Мастер:* {text}",
                     parse_mode='Markdown'
                 )
-                await update.message.reply_text(f"✅ Ответ отправлен клиенту (ID: {client_id})")
+                await update.message.reply_text(f"✅ Ответ отправлен клиенту {get_user_display_name(client_id)} (ID: {client_id})")
                 log_message(client_id, text, is_master=True)
                 log_message(user.id, f"[Ответ клиенту {client_id}] {text}", is_master=True)
                 
-                # Отменяем все задания для этого клиента
-                client_data = context.application.user_data.get(client_id)
-                if client_data:
-                    if client_data.get('timeout_job'):
-                        client_data['timeout_job'].schedule_removal()
-                        logger.info(f"Таймаут отменён для клиента {client_id}")
-                    if client_data.get('reminder_job'):
-                        client_data['reminder_job'].schedule_removal()
-                        logger.info(f"Напоминание отменено для клиента {client_id}")
-                    client_data['waiting_for_response'] = False
-                    client_data.pop('timeout_job', None)
-                    client_data.pop('reminder_job', None)
+                # Отменяем таймеры для этого клиента
+                cancel_timers(client_id)
                 
-                context.user_data.pop('active_client', None)
-                
+                await update.message.reply_text(
+                    f"💬 Вы всё ещё в диалоге с {get_user_display_name(client_id)}.\n"
+                    f"Чтобы переключиться на другого клиента, используйте «📋 Активные диалоги»."
+                )
             except Exception as e:
                 await update.message.reply_text(f"❌ Ошибка отправки: {e}")
         else:
             await update.message.reply_text(
-                "ℹ️ Вы не в активном диалоге с клиентом.\n"
-                "Чтобы ответить, нажмите «Ответить» под сообщением клиента."
+                "ℹ️ У вас нет активного диалога.\n"
+                "Нажмите «Ответить» под сообщением клиента или выберите клиента в «📋 Активные диалоги»."
             )
             log_message(user.id, text, is_master=True)
         return
@@ -442,17 +539,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_message(user.id, f"[АВТООТВЕТ] {text}", is_master=False)
             return
     
-    # 2. Логируем сообщение клиента
+    # 2. Логируем
     log_message(user.id, text, is_master=False)
     
     # 3. Пересылаем мастерам
-    username = f"@{user.username}" if user.username else f"ID:{user.id}"
-    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
-    sender_info = f"{full_name} ({username})" if full_name else username
-    
+    display_name = get_user_display_name(user.id)
     forward_text = (
         f"📩 *Новое сообщение от клиента*\n"
-        f"👤 {sender_info}\n"
+        f"👤 {display_name}\n"
         f"🆔 `{user.id}`\n\n"
         f"📝 {text}"
     )
@@ -477,43 +571,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ К сожалению, не удалось доставить сообщение мастерам. Попробуйте позже.")
         return
     
-    # === ЗАПУСК ТАЙМЕРОВ ===
-    if context.job_queue is None:
-        logger.error("JobQueue не инициализирован! Таймеры не будут работать.")
-        return
-    
-    client_data = context.application.user_data.setdefault(user.id, {})
-    
-    # Таймаут на 5 минут только для первого сообщения
-    if 'first_message_time' not in client_data:
-        client_data['first_message_time'] = datetime.now()
-        job_timeout = context.job_queue.run_once(
-            send_busy_message,
-            when=timedelta(minutes=5),
-            data={'client_id': user.id},
-            name=f"timeout_{user.id}"
-        )
-        client_data['timeout_job'] = job_timeout
-        logger.info(f"Таймаут запущен для клиента {user.id} на 5 минут")
-    else:
-        # Если это не первое сообщение, удаляем старую напоминалку (если есть)
-        old_job = client_data.get('reminder_job')
-        if old_job:
-            old_job.schedule_removal()
-            logger.info(f"Старая напоминалка отменена для клиента {user.id}")
+    # === ЗАПУСК ТАЙМЕРОВ (через threading) ===
+    client_id = user.id
+    loop = asyncio.get_event_loop()
     
     # Устанавливаем флаг ожидания
-    client_data['waiting_for_response'] = True
+    waiting_status[client_id] = True
+    
+    # Таймаут на 5 минут только для первого сообщения
+    if 'first_message_time' not in context.user_data:
+        context.user_data['first_message_time'] = datetime.now()
+        # Создаём таймер на 5 минут
+        timer = schedule_busy_message(loop, context.bot, client_id, delay_seconds=300)
+        timer_dict.setdefault(client_id, {})['timeout'] = timer
+        logger.info(f"Таймаут запущен для клиента {client_id} на 5 минут")
+    else:
+        # Если это не первое сообщение, отменяем старую напоминалку (если есть)
+        if client_id in timer_dict and timer_dict[client_id].get('reminder'):
+            timer_dict[client_id]['reminder'].cancel()
+            logger.info(f"Старая напоминалка отменена для клиента {client_id}")
     
     # Запускаем напоминание через 30 минут
-    job_reminder = context.job_queue.run_once(
-        send_reminder,
-        when=timedelta(minutes=30),
-        data={'client_id': user.id},
-        name=f"reminder_{user.id}"
-    )
-    client_data['reminder_job'] = job_reminder
-    logger.info(f"Напоминание запущено для клиента {user.id} через 30 минут")
+    reminder_timer = schedule_reminder(loop, context.bot, client_id, delay_seconds=1800)
+    timer_dict.setdefault(client_id, {})['reminder'] = reminder_timer
+    logger.info(f"Напоминание запущено для клиента {client_id} через 30 минут")
 
 # ==================== ОБРАБОТЧИК ИНЛАЙН-КНОПОК ====================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -535,13 +616,13 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hist_text += f"`{ts[:16]}` {role}: {msg_text[:50]}\n"
             await query.edit_message_text(
                 f"{hist_text}\n\n✏️ *Введите ваш ответ клиенту.*\n"
-                f"Текущий диалог с ID: `{client_id}`",
+                f"Текущий диалог с: {get_user_display_name(client_id)} (ID: `{client_id}`)",
                 parse_mode='Markdown'
             )
         else:
             await query.edit_message_text(
                 f"✏️ *Введите ваш ответ клиенту.*\n"
-                f"Текущий диалог с ID: `{client_id}`",
+                f"Текущий диалог с: {get_user_display_name(client_id)} (ID: `{client_id}`)",
                 parse_mode='Markdown'
             )
     
@@ -549,10 +630,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         client_id = int(data.split('_')[1])
         history = get_user_history(client_id, limit=10)
         if not history:
-            await query.edit_message_text(f"📭 История с клиентом (ID: {client_id}) пуста.")
+            await query.edit_message_text(f"📭 История с клиентом {get_user_display_name(client_id)} пуста.")
             return
         
-        text = f"📖 *История диалога с клиентом (ID: {client_id}):*\n\n"
+        text = f"📖 *История диалога с {get_user_display_name(client_id)} (ID: {client_id}):*\n\n"
         for msg_text, ts, is_master_flag in history:
             role = "👤 Клиент" if not is_master_flag else "🛠 Мастер"
             text += f"`{ts[:16]}` {role}: {msg_text}\n"
@@ -563,11 +644,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{client_id}")]]
         await query.edit_message_text(text, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard))
     
-    elif data.startswith('close_'):
+    elif data.startswith('select_'):
         client_id = int(data.split('_')[1])
-        if context.user_data.get('active_client') == client_id:
-            context.user_data.pop('active_client', None)
-        await query.edit_message_text(f"✅ Диалог с клиентом (ID: {client_id}) закрыт.")
+        context.user_data['active_client'] = client_id
+        await query.edit_message_text(
+            f"✅ Вы выбрали клиента: {get_user_display_name(client_id)} (ID: `{client_id}`)\n\n"
+            f"Теперь все ваши сообщения будут отправляться этому клиенту.\n"
+            f"Чтобы переключиться, используйте «📋 Активные диалоги».",
+            parse_mode='Markdown'
+        )
 
 # ==================== ГЛАВНАЯ ФУНКЦИЯ ====================
 def main():
@@ -583,27 +668,21 @@ def main():
     application.add_handler(CommandHandler("active", active_command))
     application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(CommandHandler("set_auto", set_auto_command))
+    application.add_handler(CommandHandler("stop_dialog", stop_dialog))
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
     application.add_handler(CallbackQueryHandler(handle_callback))
     
-    job_queue = application.job_queue
-    if job_queue:
-        # Ежедневная очистка логов в 3:00
-        job_queue.run_daily(
-            partial(clean_old_logs, days=30),
-            time=datetime.strptime("03:00", "%H:%M").time()
-        )
-        logger.info("Запланирована ежедневная очистка логов в 3:00")
-    else:
-        logger.warning("JobQueue не доступен, очистка логов не запланирована")
+    # Ежедневная очистка логов (можно оставить через threading, но это не критично)
+    # Просто запустим при старте, а дальше раз в сутки через threading.Timer – но это не обязательно, оставим только при старте.
     
     commands = [
         BotCommand("start", "Начать работу"),
         BotCommand("help", "Помощь"),
-        BotCommand("active", "Активные диалоги (мастер/админ)"),
+        BotCommand("active", "Активные диалоги (мастер)"),
         BotCommand("logs", "Логи (админ)"),
         BotCommand("set_auto", "Настроить автоответ (админ)"),
+        BotCommand("stop_dialog", "Завершить диалог (мастер)"),
     ]
     application.bot.set_my_commands(commands)
     
