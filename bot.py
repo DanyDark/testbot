@@ -190,7 +190,6 @@ def get_client_last_message(user_id: int) -> Optional[str]:
 
 # ==================== КЛАВИАТУРЫ ====================
 def get_client_keyboard():
-    """Клавиатура для клиента с новыми кнопками."""
     keyboard = [
         [KeyboardButton("📅 Запись"), KeyboardButton("💰 Прайс-лист")],
         [KeyboardButton("💬 Связь с мастером"), KeyboardButton("📢 Жалобы и предложения")],
@@ -358,6 +357,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 💰 **Прайс-лист** – ознакомьтесь с ценами.\n"
         "• 💬 **Связь с мастером** – напишите свой вопрос.\n"
         "• 📢 **Жалобы и предложения** – отправьте обращение напрямую директору.\n\n"
+        "📍 *Адрес студии:*\n"
+        "г.Щербинка, ул. Индустриальная д.6, 2 под. Вход через студию «Феникс».\n\n"
         "Также вы можете просто написать текст, и я передам его мастеру."
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
@@ -489,7 +490,6 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     elif text == "📢 Жалобы и предложения":
-        # Устанавливаем флаг, что клиент хочет отправить жалобу
         context.user_data['sending_complaint'] = True
         await update.message.reply_text(
             "📢 Напишите вашу жалобу или предложение. Оно будет отправлено напрямую директору."
@@ -537,13 +537,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Проверяем, отправляет ли клиент жалобу (только для обычных клиентов, не мастеров)
     if not is_master(user.id) and not is_admin(user.id) and context.user_data.get('sending_complaint'):
-        # Отправляем жалобу только администраторам
         display_name = get_user_display_name(user.id)
         complaint_text = f"📢 *Жалоба/предложение от {display_name}* (ID: `{user.id}`):\n\n{text}"
+        # Отправляем админам с кнопками для ответа
+        reply_markup = get_reply_buttons(user.id)
         sent = False
         for admin_id in ADMIN_IDS:
             try:
-                await context.bot.send_message(chat_id=admin_id, text=complaint_text, parse_mode='Markdown')
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=complaint_text,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
                 sent = True
             except Exception as e:
                 logger.error(f"Не удалось отправить жалобу админу {admin_id}: {e}")
