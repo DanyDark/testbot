@@ -56,7 +56,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Дефолтный автоответ
     cur.execute("SELECT COUNT(*) FROM auto_response")
     if cur.fetchone()[0] == 0:
         cur.execute('''
@@ -67,7 +66,6 @@ def init_db():
     conn.close()
 
 def clean_old_logs(days=30):
-    """Удаляет логи старше указанного количества дней."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('''
@@ -153,42 +151,7 @@ def get_active_clients() -> List[int]:
     conn.close()
     return [row[0] for row in rows]
 
-# ==================== КРАСИВЫЕ КЛАВИАТУРЫ ====================
-def get_client_keyboard():
-    """Клавиатура для обычного клиента (красивая)."""
-    keyboard = [
-        [KeyboardButton("📋 Главное меню"), KeyboardButton("❓ Помощь")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def get_master_keyboard():
-    """Клавиатура для мастера (красивая)."""
-    keyboard = [
-        [KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def get_admin_keyboard():
-    """Клавиатура для администратора (красивая)."""
-    keyboard = [
-        [KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")],
-        [KeyboardButton("📜 Логи"), KeyboardButton("⚙️ Настроить автоответ")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def get_reply_buttons(client_id: int):
-    """Инлайн-кнопки для мастера: Ответить, История, Закрыть (красивые)."""
-    keyboard = [
-        [
-            InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{client_id}"),
-            InlineKeyboardButton("📖 История", callback_data=f"history_{client_id}")
-        ],
-        [InlineKeyboardButton("❌ Закрыть диалог", callback_data=f"close_{client_id}")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
 def get_client_info(user_id: int) -> str:
-    """Возвращает строку с именем и юзернеймом клиента."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("SELECT first_name, username FROM users WHERE user_id = ?", (user_id,))
@@ -201,6 +164,40 @@ def get_client_info(user_id: int) -> str:
         return name
     return f"ID: {user_id}"
 
+# ==================== КЛАВИАТУРЫ (исправлены) ====================
+def get_client_keyboard():
+    """Клавиатура для обычного клиента — только помощь."""
+    keyboard = [
+        [KeyboardButton("❓ Помощь")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_master_keyboard():
+    """Клавиатура для мастера."""
+    keyboard = [
+        [KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_admin_keyboard():
+    """Клавиатура для администратора."""
+    keyboard = [
+        [KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")],
+        [KeyboardButton("📜 Логи"), KeyboardButton("⚙️ Настроить автоответ")]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_reply_buttons(client_id: int):
+    """Инлайн-кнопки для мастера."""
+    keyboard = [
+        [
+            InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{client_id}"),
+            InlineKeyboardButton("📖 История", callback_data=f"history_{client_id}")
+        ],
+        [InlineKeyboardButton("❌ Закрыть диалог", callback_data=f"close_{client_id}")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
 # ==================== ОБРАБОТЧИКИ КОМАНД И ТЕКСТОВЫХ КНОПОК ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -208,9 +205,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     welcome_text = (
         f"👋 Добрый день! Это виртуальный помощник студии маникюра «{BUSINESS_NAME}».\n\n"
-        f"💬 Внизу экрана располагается меню – нажмите на подходящий для вас пункт.\n"
-        f"Если у вас есть вопросы по ценам или записи, просто напишите их сюда – "
-        f"я передам их мастеру."
+        f"💬 Просто напишите свой вопрос, и я передам его мастеру.\n"
+        f"Если вы спросите про цену, я сразу дам ответ."
     )
     
     if is_admin(user.id):
@@ -303,13 +299,13 @@ async def set_auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     update_auto_response(keyword, response)
     await update.message.reply_text(f"✅ Автоответчик обновлён!\n\n🔑 Ключевое слово: `{keyword}`\n💬 Ответ: {response}", parse_mode='Markdown')
 
-# ==================== ОБРАБОТЧИК ТЕКСТОВЫХ КНОПОК (reply-клавиатура) ====================
+# ==================== ОБРАБОТЧИК ТЕКСТОВЫХ КНОПОК ====================
 async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обрабатывает нажатия на Reply-кнопки (меню)."""
     user = update.effective_user
     text = update.message.text
     
-    if text == "📋 Главное меню" or text == "📋 Активные диалоги":
+    if text == "📋 Активные диалоги":
         await active_command(update, context)
     elif text == "❓ Помощь":
         await help_command(update, context)
@@ -324,12 +320,10 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Если текст не совпадает с кнопками, обрабатываем как обычное сообщение
         await handle_message(update, context)
 
-# ==================== ЗАДАНИЯ ДЛЯ ТАЙМЕРОВ (автоответ "заняты" и напоминания) ====================
+# ==================== ЗАДАНИЯ ДЛЯ ТАЙМЕРОВ ====================
 async def send_busy_message(context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет клиенту сообщение, что все мастера заняты (через 5 минут после первого сообщения)."""
     job = context.job
     client_id = job.data['client_id']
-    # Проверяем, не ответил ли уже мастер (по флагу waiting_for_response)
     client_data = context.application.user_data.get(client_id, {})
     if client_data.get('waiting_for_response', False):
         try:
@@ -339,22 +333,18 @@ async def send_busy_message(context: ContextTypes.DEFAULT_TYPE):
                      "Ожидайте ответа, мы свяжемся с вами в ближайшее время.",
                 parse_mode='Markdown'
             )
-            # Логируем это автоматическое сообщение
             log_message(client_id, "[АВТО: мастера заняты]", is_master=False)
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение о занятости клиенту {client_id}: {e}")
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет напоминание всем мастерам, что клиент ждёт ответа (каждые 30 минут)."""
     job = context.job
     client_id = job.data['client_id']
     client_data = context.application.user_data.get(client_id, {})
     
-    # Если клиент уже получил ответ, ничего не делаем
     if not client_data.get('waiting_for_response', False):
         return
     
-    # Получаем имя клиента и последнее сообщение
     name = get_client_info(client_id)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -374,7 +364,6 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         f"Нажмите «Ответить» в одном из предыдущих уведомлений."
     )
     
-    # Отправляем всем мастерам
     for master_id in MASTER_IDS:
         try:
             await context.bot.send_message(
@@ -385,7 +374,6 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Не удалось отправить напоминание мастеру {master_id}: {e}")
     
-    # Перезапускаем задание через 30 минут, если клиент всё ещё ждёт
     if client_data.get('waiting_for_response', False):
         context.job_queue.run_once(
             send_reminder,
@@ -396,7 +384,6 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает все текстовые сообщения (и команды, и обычные)."""
     user = update.effective_user
     text = update.message.text
     
@@ -419,24 +406,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log_message(client_id, text, is_master=True)
                 log_message(user.id, f"[Ответ клиенту {client_id}] {text}", is_master=True)
                 
-                # === ОТМЕНА ВСЕХ ЗАДАНИЙ ДЛЯ ЭТОГО КЛИЕНТА ===
+                # Отменяем все задания для этого клиента
                 client_data = context.application.user_data.get(client_id)
                 if client_data:
-                    # Отменяем таймаут и напоминание
-                    job_timeout = client_data.get('timeout_job')
-                    if job_timeout:
-                        job_timeout.schedule_removal()
-                    job_reminder = client_data.get('reminder_job')
-                    if job_reminder:
-                        job_reminder.schedule_removal()
-                    # Сбрасываем флаги
+                    if client_data.get('timeout_job'):
+                        client_data['timeout_job'].schedule_removal()
+                    if client_data.get('reminder_job'):
+                        client_data['reminder_job'].schedule_removal()
                     client_data['waiting_for_response'] = False
-                    client_data['first_message_time'] = None
-                    # Удаляем записи о заданиях, чтобы не висели
                     client_data.pop('timeout_job', None)
                     client_data.pop('reminder_job', None)
                 
-                # Очищаем активный диалог у мастера (чтобы не отправлять повторно)
                 context.user_data.pop('active_client', None)
                 
             except Exception as e:
@@ -451,7 +431,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # === ОБЫЧНЫЙ КЛИЕНТ ===
     
-    # 1. Проверяем автоответчик
+    # 1. Автоответчик
     if not context.user_data.get('auto_triggered'):
         keyword, response = get_auto_response()
         if keyword and keyword.lower() in text.lower():
@@ -463,7 +443,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 2. Логируем сообщение клиента
     log_message(user.id, text, is_master=False)
     
-    # 3. Пересылаем всем мастерам
+    # 3. Пересылаем мастерам
     username = f"@{user.username}" if user.username else f"ID:{user.id}"
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
     sender_info = f"{full_name} ({username})" if full_name else username
@@ -493,15 +473,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Ваше сообщение отправлено мастеру. Ожидайте ответа.")
     else:
         await update.message.reply_text("⚠️ К сожалению, не удалось доставить сообщение мастерам. Попробуйте позже.")
-        return  # Не запускаем таймеры, если не доставлено
+        return
     
-    # === ЗАПУСК ТАЙМЕРОВ ДЛЯ КЛИЕНТА ===
+    # === ЗАПУСК ТАЙМЕРОВ ===
     client_data = context.application.user_data.setdefault(user.id, {})
     
-    # Проверяем, первое ли это сообщение (по отсутствию first_message_time)
     if 'first_message_time' not in client_data:
         client_data['first_message_time'] = datetime.now()
-        # Запускаем таймер на 5 минут для уведомления о занятости
         job_timeout = context.job_queue.run_once(
             send_busy_message,
             when=timedelta(minutes=5),
@@ -510,16 +488,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         client_data['timeout_job'] = job_timeout
     else:
-        # Если это не первое сообщение, таймаут не запускаем, но напоминание перезапустим
-        # (удаляем старую job если есть)
         old_job = client_data.get('reminder_job')
         if old_job:
             old_job.schedule_removal()
     
-    # Устанавливаем флаг ожидания ответа
     client_data['waiting_for_response'] = True
     
-    # Запускаем / перезапускаем напоминание через 30 минут
     job_reminder = context.job_queue.run_once(
         send_reminder,
         when=timedelta(minutes=30),
@@ -587,37 +561,32 @@ def main():
     init_db()
     logger.info("База данных инициализирована")
     
-    # Очистка логов при старте
     clean_old_logs(30)
     
     application = Application.builder().token(TOKEN).build()
     
-    # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("active", active_command))
     application.add_handler(CommandHandler("logs", logs_command))
     application.add_handler(CommandHandler("set_auto", set_auto_command))
     
-    # Обработчики
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
     application.add_handler(CallbackQueryHandler(handle_callback))
     
-    # Ежедневная очистка логов (запускаем в 3:00 ночи)
     job_queue = application.job_queue
     if job_queue:
         job_queue.run_daily(
             clean_old_logs,
             time=datetime.strptime("03:00", "%H:%M").time(),
-            days=30  # передаём параметр days=30
+            days=30
         )
         logger.info("Запланирована ежедневная очистка логов в 3:00")
     
-    # Устанавливаем меню-команды
     commands = [
         BotCommand("start", "Начать работу"),
         BotCommand("help", "Помощь"),
-        BotCommand("active", "Активные диалоги"),
+        BotCommand("active", "Активные диалоги (мастер/админ)"),
         BotCommand("logs", "Логи (админ)"),
         BotCommand("set_auto", "Настроить автоответ (админ)"),
     ]
