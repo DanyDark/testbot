@@ -2,6 +2,7 @@ import os
 import logging
 import sqlite3
 from datetime import datetime, timedelta
+from functools import partial
 from typing import Dict, Optional, List, Tuple
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, ReplyKeyboardMarkup, KeyboardButton
@@ -164,23 +165,16 @@ def get_client_info(user_id: int) -> str:
         return name
     return f"ID: {user_id}"
 
-# ==================== КЛАВИАТУРЫ (исправлены) ====================
+# ==================== КЛАВИАТУРЫ ====================
 def get_client_keyboard():
-    """Клавиатура для обычного клиента — только помощь."""
-    keyboard = [
-        [KeyboardButton("❓ Помощь")]
-    ]
+    keyboard = [[KeyboardButton("❓ Помощь")]]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_master_keyboard():
-    """Клавиатура для мастера."""
-    keyboard = [
-        [KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")]
-    ]
+    keyboard = [[KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")]]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_admin_keyboard():
-    """Клавиатура для администратора."""
     keyboard = [
         [KeyboardButton("📋 Активные диалоги"), KeyboardButton("❓ Помощь")],
         [KeyboardButton("📜 Логи"), KeyboardButton("⚙️ Настроить автоответ")]
@@ -188,7 +182,6 @@ def get_admin_keyboard():
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_reply_buttons(client_id: int):
-    """Инлайн-кнопки для мастера."""
     keyboard = [
         [
             InlineKeyboardButton("✏️ Ответить", callback_data=f"reply_{client_id}"),
@@ -301,7 +294,6 @@ async def set_auto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== ОБРАБОТЧИК ТЕКСТОВЫХ КНОПОК ====================
 async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на Reply-кнопки (меню)."""
     user = update.effective_user
     text = update.message.text
     
@@ -317,13 +309,14 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode='Markdown'
         )
     else:
-        # Если текст не совпадает с кнопками, обрабатываем как обычное сообщение
         await handle_message(update, context)
 
-# ==================== ЗАДАНИЯ ДЛЯ ТАЙМЕРОВ ====================
+# ==================== ЗАДАНИЯ ДЛЯ ТАЙМЕРОВ (с логами) ====================
 async def send_busy_message(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("=== Функция send_busy_message вызвана ===")
     job = context.job
     client_id = job.data['client_id']
+    logger.info(f"Проверка клиента {client_id}")
     client_data = context.application.user_data.get(client_id, {})
     if client_data.get('waiting_for_response', False):
         try:
@@ -334,15 +327,20 @@ async def send_busy_message(context: ContextTypes.DEFAULT_TYPE):
                 parse_mode='Markdown'
             )
             log_message(client_id, "[АВТО: мастера заняты]", is_master=False)
+            logger.info(f"Сообщение о занятости отправлено клиенту {client_id}")
         except Exception as e:
             logger.error(f"Не удалось отправить сообщение о занятости клиенту {client_id}: {e}")
+    else:
+        logger.info(f"Клиент {client_id} уже не ждёт ответа, таймаут пропущен")
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("=== Функция send_reminder вызвана ===")
     job = context.job
     client_id = job.data['client_id']
     client_data = context.application.user_data.get(client_id, {})
     
     if not client_data.get('waiting_for_response', False):
+        logger.info(f"Клиент {client_id} уже не ждёт, напоминание отменено")
         return
     
     name = get_client_info(client_id)
@@ -371,9 +369,11 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
                 text=reminder_text,
                 parse_mode='Markdown'
             )
+            logger.info(f"Напоминание отправлено мастеру {master_id}")
         except Exception as e:
             logger.error(f"Не удалось отправить напоминание мастеру {master_id}: {e}")
     
+    # Перезапускаем напоминание через 30 минут, если клиент всё ещё ждёт
     if client_data.get('waiting_for_response', False):
         context.job_queue.run_once(
             send_reminder,
@@ -411,8 +411,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if client_data:
                     if client_data.get('timeout_job'):
                         client_data['timeout_job'].schedule_removal()
+                        logger.info(f"Таймаут отменён для клиента {client_id}")
                     if client_data.get('reminder_job'):
                         client_data['reminder_job'].schedule_removal()
+                        logger.info(f"Напоминание отменено для клиента {client_id}")
                     client_data['waiting_for_response'] = False
                     client_data.pop('timeout_job', None)
                     client_data.pop('reminder_job', None)
@@ -476,8 +478,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # === ЗАПУСК ТАЙМЕРОВ ===
+    if context.job_queue is None:
+        logger.error("JobQueue не инициализирован! Таймеры не будут работать.")
+        return
+    
     client_data = context.application.user_data.setdefault(user.id, {})
     
+    # Таймаут на 5 минут только для первого сообщения
     if 'first_message_time' not in client_data:
         client_data['first_message_time'] = datetime.now()
         job_timeout = context.job_queue.run_once(
@@ -487,13 +494,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name=f"timeout_{user.id}"
         )
         client_data['timeout_job'] = job_timeout
+        logger.info(f"Таймаут запущен для клиента {user.id} на 5 минут")
     else:
+        # Если это не первое сообщение, удаляем старую напоминалку (если есть)
         old_job = client_data.get('reminder_job')
         if old_job:
             old_job.schedule_removal()
+            logger.info(f"Старая напоминалка отменена для клиента {user.id}")
     
+    # Устанавливаем флаг ожидания
     client_data['waiting_for_response'] = True
     
+    # Запускаем напоминание через 30 минут
     job_reminder = context.job_queue.run_once(
         send_reminder,
         when=timedelta(minutes=30),
@@ -501,6 +513,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name=f"reminder_{user.id}"
     )
     client_data['reminder_job'] = job_reminder
+    logger.info(f"Напоминание запущено для клиента {user.id} через 30 минут")
 
 # ==================== ОБРАБОТЧИК ИНЛАЙН-КНОПОК ====================
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -576,12 +589,14 @@ def main():
     
     job_queue = application.job_queue
     if job_queue:
+        # Ежедневная очистка логов в 3:00
         job_queue.run_daily(
-            clean_old_logs,
-            time=datetime.strptime("03:00", "%H:%M").time(),
-            days=30
+            partial(clean_old_logs, days=30),
+            time=datetime.strptime("03:00", "%H:%M").time()
         )
         logger.info("Запланирована ежедневная очистка логов в 3:00")
+    else:
+        logger.warning("JobQueue не доступен, очистка логов не запланирована")
     
     commands = [
         BotCommand("start", "Начать работу"),
