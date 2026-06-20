@@ -190,7 +190,12 @@ def get_client_last_message(user_id: int) -> Optional[str]:
 
 # ==================== КЛАВИАТУРЫ ====================
 def get_client_keyboard():
-    keyboard = [[KeyboardButton("❓ Помощь")]]
+    """Клавиатура для клиента с новыми кнопками."""
+    keyboard = [
+        [KeyboardButton("📅 Запись"), KeyboardButton("💰 Прайс-лист")],
+        [KeyboardButton("💬 Связь с мастером"), KeyboardButton("📢 Жалобы и предложения")],
+        [KeyboardButton("❓ Помощь")]
+    ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_master_keyboard():
@@ -225,13 +230,11 @@ def get_clients_list_keyboard(clients: List[int]):
     return InlineKeyboardMarkup(keyboard)
 
 # ==================== ТАЙМЕРЫ (на threading) ====================
-# Храним таймеры в словаре: {client_id: {'timeout': timer, 'reminder': timer}}
-# Чтобы отменять их при ответе мастера.
+timer_dict = {}
+waiting_status = {}
 
 def schedule_busy_message(loop, bot, client_id, delay_seconds=300):
-    """Запускает таймер на отправку сообщения о занятости через delay_seconds."""
     def wrapper():
-        # Эта функция выполняется в отдельном потоке
         asyncio.run_coroutine_threadsafe(
             send_busy_message_coro(bot, client_id),
             loop
@@ -242,12 +245,6 @@ def schedule_busy_message(loop, bot, client_id, delay_seconds=300):
     return timer
 
 async def send_busy_message_coro(bot, client_id):
-    """Асинхронная функция отправки сообщения о занятости."""
-    # Проверяем, всё ли ещё ждёт ответа – это должно быть проверено в вызывающей функции,
-    # но для надёжности проверим здесь через user_data (но user_data не передаётся легко)
-    # Можно сделать глобальный словарь или передавать context, но проще проверить через БД или флаг,
-    # который мы будем хранить в глобальном словаре.
-    # Используем глобальный словарь waiting_status
     if waiting_status.get(client_id, False):
         try:
             await bot.send_message(
@@ -262,7 +259,6 @@ async def send_busy_message_coro(bot, client_id):
             logger.error(f"Не удалось отправить сообщение о занятости клиенту {client_id}: {e}")
 
 def schedule_reminder(loop, bot, client_id, delay_seconds=1800):
-    """Запускает таймер на отправку напоминания мастеру через delay_seconds."""
     def wrapper():
         asyncio.run_coroutine_threadsafe(
             send_reminder_coro(bot, client_id),
@@ -274,7 +270,6 @@ def schedule_reminder(loop, bot, client_id, delay_seconds=1800):
     return timer
 
 async def send_reminder_coro(bot, client_id):
-    """Асинхронная функция отправки напоминания мастерам."""
     if not waiting_status.get(client_id, False):
         return
     
@@ -299,18 +294,11 @@ async def send_reminder_coro(bot, client_id):
         except Exception as e:
             logger.error(f"Не удалось отправить напоминание мастеру {master_id}: {e}")
     
-    # Если клиент всё ещё ждёт, запускаем следующее напоминание через 30 минут
     if waiting_status.get(client_id, False):
         timer = schedule_reminder(asyncio.get_event_loop(), bot, client_id, delay_seconds=1800)
-        # Сохраняем таймер в глобальном словаре (если он ещё не отменён)
         timer_dict[client_id]['reminder'] = timer
 
-# Глобальные словари для состояния таймеров
-timer_dict = {}  # {client_id: {'timeout': timer, 'reminder': timer}}
-waiting_status = {}  # {client_id: True/False}
-
 def cancel_timers(client_id):
-    """Отменяет все таймеры для клиента."""
     if client_id in timer_dict:
         if timer_dict[client_id].get('timeout'):
             timer_dict[client_id]['timeout'].cancel()
@@ -365,10 +353,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     help_text = (
         "📖 *Справка по боту*\n\n"
-        "• Просто напишите свой вопрос, и я передам его мастеру.\n"
-        "• Если вы спросите про *цену*, я сразу дам ответ.\n"
-        "• Мастера увидят ваше сообщение и смогут ответить.\n\n"
-        "Для связи с мастером просто пишите сюда."
+        "Воспользуйтесь кнопками меню для быстрого доступа к основным функциям.\n\n"
+        "• 📅 **Запись** – получите ссылку для записи.\n"
+        "• 💰 **Прайс-лист** – ознакомьтесь с ценами.\n"
+        "• 💬 **Связь с мастером** – напишите свой вопрос.\n"
+        "• 📢 **Жалобы и предложения** – отправьте обращение напрямую директору.\n\n"
+        "Также вы можете просто написать текст, и я передам его мастеру."
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')
     log_message(user.id, "/help", is_master=False)
@@ -455,7 +445,6 @@ async def stop_dialog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if 'active_client' in context.user_data:
         client_id = context.user_data.pop('active_client')
-        # Отменяем таймеры для этого клиента (если они ещё висят)
         cancel_timers(client_id)
         await update.message.reply_text(f"✅ Диалог с клиентом (ID: {client_id}) завершён.")
     else:
@@ -466,21 +455,70 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     user = update.effective_user
     text = update.message.text
     
-    if text == "📋 Активные диалоги":
+    # Обработка кнопок клиента
+    if text == "📅 Запись":
+        await update.message.reply_text(
+            "📅 Для записи перейдите по ссылке и выберите удобное для вас время:\n"
+            "https://dikidi.net/2014378"
+        )
+        log_message(user.id, "[Кнопка: Запись]", is_master=False)
+        return
+    
+    elif text == "💰 Прайс-лист":
+        prices = (
+            "💰 *Прайс-лист на услуги:*\n\n"
+            "• «Гигиенический маникюр» от 500₽\n"
+            "• «Маникюр с покрытием» от 1.500₽\n"
+            "• «Гелевая коррекция» от 3.200₽\n"
+            "• «Чёткий квадрат» от 3.200₽\n"
+            "• «Наращивание ногтей до 3» от 3.500₽\n"
+            "• «Наращивание ногтей XXL и Crayzy форм» от 4.000₽\n"
+            "• «Снятие покрытия без последующего» 500₽\n"
+            "• «Снятие покрытия другой студии/мастера» 300₽\n"
+            "• «Ремонт ногтя вне записи» 300₽"
+        )
+        await update.message.reply_text(prices, parse_mode='Markdown')
+        log_message(user.id, "[Кнопка: Прайс-лист]", is_master=False)
+        return
+    
+    elif text == "💬 Связь с мастером":
+        await update.message.reply_text(
+            "💬 Напишите ваш вопрос мастеру, и я передам его. Просто введите текст."
+        )
+        log_message(user.id, "[Кнопка: Связь с мастером]", is_master=False)
+        return
+    
+    elif text == "📢 Жалобы и предложения":
+        # Устанавливаем флаг, что клиент хочет отправить жалобу
+        context.user_data['sending_complaint'] = True
+        await update.message.reply_text(
+            "📢 Напишите вашу жалобу или предложение. Оно будет отправлено напрямую директору."
+        )
+        log_message(user.id, "[Кнопка: Жалобы и предложения]", is_master=False)
+        return
+    
+    # Обработка кнопок мастера/админа
+    elif text == "📋 Активные диалоги":
         await active_command(update, context)
+        return
     elif text == "❓ Помощь":
         await help_command(update, context)
+        return
     elif text == "📜 Логи" and is_admin(user.id):
         await logs_command(update, context)
+        return
     elif text == "⚙️ Настроить автоответ" and is_admin(user.id):
         await update.message.reply_text(
             "Введите команду в формате:\n`/set_auto ключевое_слово текст ответа`",
             parse_mode='Markdown'
         )
+        return
     elif text == "🔄 Закончить диалог" and (is_master(user.id) or is_admin(user.id)):
         await stop_dialog(update, context)
-    else:
-        await handle_message(update, context)
+        return
+    
+    # Если ни одна кнопка не подошла – обрабатываем как обычное сообщение
+    await handle_message(update, context)
 
 # ==================== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ ====================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -497,7 +535,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     save_user(user.id, user.username, user.first_name, user.last_name)
     
-    # Если сообщение от мастера
+    # Проверяем, отправляет ли клиент жалобу (только для обычных клиентов, не мастеров)
+    if not is_master(user.id) and not is_admin(user.id) and context.user_data.get('sending_complaint'):
+        # Отправляем жалобу только администраторам
+        display_name = get_user_display_name(user.id)
+        complaint_text = f"📢 *Жалоба/предложение от {display_name}* (ID: `{user.id}`):\n\n{text}"
+        sent = False
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=complaint_text, parse_mode='Markdown')
+                sent = True
+            except Exception as e:
+                logger.error(f"Не удалось отправить жалобу админу {admin_id}: {e}")
+        if sent:
+            await update.message.reply_text("✅ Ваша жалоба/предложение отправлена директору. Спасибо!")
+            log_message(user.id, f"[ЖАЛОБА] {text}", is_master=False)
+        else:
+            await update.message.reply_text("⚠️ Не удалось отправить жалобу. Попробуйте позже.")
+        # Сбрасываем флаг
+        context.user_data.pop('sending_complaint', None)
+        return
+    
+    # Если сообщение от мастера (или админа)
     if is_master(user.id) or is_admin(user.id):
         client_id = context.user_data.get('active_client')
         if client_id:
@@ -511,7 +570,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log_message(client_id, text, is_master=True)
                 log_message(user.id, f"[Ответ клиенту {client_id}] {text}", is_master=True)
                 
-                # Отменяем таймеры для этого клиента
                 cancel_timers(client_id)
                 
                 await update.message.reply_text(
@@ -528,7 +586,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_message(user.id, text, is_master=True)
         return
     
-    # === ОБЫЧНЫЙ КЛИЕНТ ===
+    # === ОБЫЧНЫЙ КЛИЕНТ (не мастер, не админ, не жалоба) ===
     
     # 1. Автоответчик
     if not context.user_data.get('auto_triggered'):
@@ -571,27 +629,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ К сожалению, не удалось доставить сообщение мастерам. Попробуйте позже.")
         return
     
-    # === ЗАПУСК ТАЙМЕРОВ (через threading) ===
+    # === ЗАПУСК ТАЙМЕРОВ ===
     client_id = user.id
     loop = asyncio.get_event_loop()
     
-    # Устанавливаем флаг ожидания
     waiting_status[client_id] = True
     
-    # Таймаут на 5 минут только для первого сообщения
     if 'first_message_time' not in context.user_data:
         context.user_data['first_message_time'] = datetime.now()
-        # Создаём таймер на 5 минут
         timer = schedule_busy_message(loop, context.bot, client_id, delay_seconds=300)
         timer_dict.setdefault(client_id, {})['timeout'] = timer
         logger.info(f"Таймаут запущен для клиента {client_id} на 5 минут")
     else:
-        # Если это не первое сообщение, отменяем старую напоминалку (если есть)
         if client_id in timer_dict and timer_dict[client_id].get('reminder'):
             timer_dict[client_id]['reminder'].cancel()
             logger.info(f"Старая напоминалка отменена для клиента {client_id}")
     
-    # Запускаем напоминание через 30 минут
     reminder_timer = schedule_reminder(loop, context.bot, client_id, delay_seconds=1800)
     timer_dict.setdefault(client_id, {})['reminder'] = reminder_timer
     logger.info(f"Напоминание запущено для клиента {client_id} через 30 минут")
@@ -672,9 +725,6 @@ def main():
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_buttons))
     application.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Ежедневная очистка логов (можно оставить через threading, но это не критично)
-    # Просто запустим при старте, а дальше раз в сутки через threading.Timer – но это не обязательно, оставим только при старте.
     
     commands = [
         BotCommand("start", "Начать работу"),
