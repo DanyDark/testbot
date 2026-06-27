@@ -197,7 +197,6 @@ def get_client_last_message(user_id: int) -> Optional[str]:
 
 # ==================== ФУНКЦИИ ДЛЯ АКЦИЙ ====================
 def add_promotion(text: str):
-    """Сохраняет новую акцию."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('''
@@ -207,7 +206,6 @@ def add_promotion(text: str):
     conn.close()
 
 def get_current_promotion() -> Optional[str]:
-    """Возвращает текст последней акции или None."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute('''
@@ -222,7 +220,8 @@ def get_client_keyboard():
     keyboard = [
         [KeyboardButton("📅 Запись"), KeyboardButton("💰 Прайс-лист")],
         [KeyboardButton("💬 Связь с мастером"), KeyboardButton("📢 Жалобы и предложения")],
-        [KeyboardButton("🎉 Акции"), KeyboardButton("❓ Помощь")]
+        [KeyboardButton("🎉 Акции"), KeyboardButton("🌐 Мы в соц.сетях")],
+        [KeyboardButton("❓ Помощь")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
@@ -386,7 +385,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 💰 **Прайс-лист** – ознакомьтесь с ценами.\n"
         "• 💬 **Связь с мастером** – напишите свой вопрос.\n"
         "• 📢 **Жалобы и предложения** – отправьте обращение напрямую директору.\n"
-        "• 🎉 **Акции** – посмотрите текущие акции.\n\n"
+        "• 🎉 **Акции** – посмотрите текущие акции.\n"
+        "• 🌐 **Мы в соц.сетях** – ссылки на наши группы в Telegram и ВКонтакте.\n\n"
         "📍 *Адрес студии:*\n"
         "г.Щербинка, ул. Индустриальная д.6, 2 под. Вход через студию «Феникс».\n\n"
         "Также вы можете просто написать текст, и я передам его мастеру."
@@ -534,6 +534,16 @@ async def handle_text_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("📢 На данный момент акций нет. Следите за обновлениями!")
         log_message(user.id, "[Кнопка: Акции]", is_master=False)
+        return
+    
+    elif text == "🌐 Мы в соц.сетях":
+        await update.message.reply_text(
+            "🌐 *Мы в социальных сетях:*\n\n"
+            "📱 *Telegram-группа:* https://t.me/+htQ7CwNip2c1ZWM6\n"
+            "📱 *Группа ВКонтакте:* https://vk.ru/morfeenbeauty",
+            parse_mode='Markdown'
+        )
+        log_message(user.id, "[Кнопка: Мы в соц.сетях]", is_master=False)
         return
     
     # Обработка кнопок мастера/админа
